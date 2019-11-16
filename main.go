@@ -5,10 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
+	"math"
 	"net/http"
+	"sort"
+
+	"github.com/gorilla/mux"
 )
 
-//UserInfo represents information received from post request to creditcards endpoint
+//UserInfo is the information received as a body of the post request to /creditcard
 type UserInfo struct {
 	FirstName   string `json:"firstname"`
 	LastName    string `json:"lastname"`
@@ -18,76 +23,91 @@ type UserInfo struct {
 	Salary      int    `json:"salary"`
 }
 
-//CreditCard represents the response of creditcards endpoint
+//CreditCard is the response of /creditcard endpoint if successful
 type CreditCard struct {
 	Provider  string   `json:"provider"`
 	Name      string   `json:"name"`
 	ApplyURL  string   `json:"apply-url"`
-	Apr       float32  `json:"apr"`
+	Apr       float64  `json:"apr"`
 	Features  []string `json:"features"`
-	CardScore float32  `json:"card-score"`
+	CardScore float64  `json:"card-score"`
 }
 
-//CreditCards contains all credit cards
+//CSCardResponse is the response of /cards endpoint if successful
+type CSCardResponse struct {
+	CardName    string   `json:"cardName,omitempty"`
+	URL         string   `json:"url,omitempty"`
+	Apr         float64  `json:"apr,omitempty"`
+	Eligibility float64  `json:"eligibility,omitempty"`
+	Features    []string `json:"features,omitempty"`
+}
+
+//ScoredCardResponse is the response of /creditcards endpoint if successful
+type ScoredCardResponse struct {
+	Card           string   `json:"card,omitempty"`
+	ApplyURL       string   `json:"apply-url,omitempty"`
+	Apr            float64  `json:"annual-percentage-rate,omitempty"`
+	ApprovalRating float64  `json:"approval-rating,omitempty"`
+	Attributes     []string `json:"attributes,omitempty"`
+	IntroOffers    []string `json:"introductory-offers,omitempty"`
+}
+
+//CreditCards contains all credit cards from CSCards and ScoredCards
 type CreditCards []CreditCard
 
 func main() {
-	// handleRequest()
-	userInfo := UserInfo{
-		FirstName:   "John",
-		LastName:    "Smith",
-		DOB:         "1991/04/18",
-		CreditScore: 500,
-		EmpStatus:   "FULL_TIME",
-		Salary:      28000,
+	r := mux.NewRouter()
+	r.HandleFunc("/creditcard", handler).Methods(http.MethodPost)
+	err := http.ListenAndServe(":8081", r)
+	if err != nil {
+		log.Fatal("error occurred")
 	}
-	userInfo.csCards()
-	userInfo.scoredCards()
 }
 
-func allCreditCards(w http.ResponseWriter, r *http.Request) {
-	creditCards := CreditCards{
-		CreditCard{Provider: "Test Provider", Name: "Test NAme", ApplyURL: "http://www.example.com/apply", Apr: 34.3, Features: []string{"supports ApplyPay", "free interest for 10 years"}, CardScore: 0.2},
-	}
-	fmt.Println("Endpoint Hit: All Credit Cards Endpoint")
-	json.NewEncoder(w).Encode(creditCards)
-}
-
-func homePage(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Homepage Endpoint Hit")
-}
-
-// func handleRequest() {
-// 	router := mux.NewRouter().StrictSlash(true)
-// 	router.HandleFunc("/", homePage)
-// 	router.HandleFunc("/creditcard", getUserInfo).Methods("POST")
-// 	router.HandleFunc("/creditcards", allCreditCards).Methods("GET")
-// 	log.Fatal(http.ListenAndServe(":8081", router))
-// }
-
-func getUserInfo(w http.ResponseWriter, r *http.Request) *UserInfo {
+//handler receives the user info, passes it to CSCard and ScoredCard APIs, format and sort the responses
+func handler(w http.ResponseWriter, r *http.Request) {
 	var newUserInfo UserInfo
 	reqBody, err := ioutil.ReadAll(r.Body)
 	if err != nil {
+		w.WriteHeader(400)
 		fmt.Fprintf(w, "please enter user info")
 	}
-	json.Unmarshal(reqBody, &newUserInfo)
+	err = json.Unmarshal(reqBody, &newUserInfo)
+	if err != nil {
+		w.WriteHeader(400)
+		fmt.Fprintf(w, "please enter the body in JSON")
+	}
+	var creditcards []CreditCard
+	csCardsResults := newUserInfo.getCSCards()
+	for _, csCardsResult := range csCardsResults {
+		creditcards = append(creditcards, csCardsResult)
+	}
+	scoredCardsResults := newUserInfo.getScoredCards()
+	for _, scoredCardResult := range scoredCardsResults {
+		creditcards = append(creditcards, scoredCardResult)
+	}
+
+	sort.SliceStable(creditcards, func(i, j int) bool {
+		return creditcards[j].CardScore < creditcards[i].CardScore
+	})
+
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(newUserInfo)
-	return &newUserInfo
+	err = json.NewEncoder(w).Encode(creditcards)
+	if err != nil {
+		w.WriteHeader(500)
+		fmt.Fprintf(w, "failed to response in JSON")
+	}
 }
 
-func (userInfo *UserInfo) csCards() {
+//getCSCards sends a post request to CSCard API endpoint and formats the response
+func (userInfo *UserInfo) getCSCards() []CreditCard {
 	url := "https://y4xvbk1ki5.execute-api.us-west-2.amazonaws.com/CS/v1/cards"
-	fmt.Println("URL:>", url)
 
 	var jsonStr = []byte(fmt.Sprintf(`{
 		"fullName": "%s %s",
 		"dateOfBirth": "%s",
 		"creditScore": %d
 	}`, userInfo.FirstName, userInfo.LastName, userInfo.DOB, userInfo.CreditScore))
-	myString := string(jsonStr)
-	fmt.Printf("XXXXXXX: %v\n", myString)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))
 	req.Header.Set("Content-Type", "application/json")
@@ -99,15 +119,39 @@ func (userInfo *UserInfo) csCards() {
 	}
 	defer resp.Body.Close()
 
-	fmt.Println("response Status:", resp.Status)
-	fmt.Println("response Headers:", resp.Header)
-	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Println("response Body:", string(body))
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var csCardResult []CSCardResponse
+
+	var creditCardResults []CreditCard
+
+	err = json.Unmarshal(body, &csCardResult)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, result := range csCardResult {
+		sc := math.Pow(1/result.Apr, 2)
+		creditCard := CreditCard{
+			Provider:  "CSCards",
+			Name:      result.CardName,
+			ApplyURL:  result.URL,
+			Apr:       result.Apr,
+			Features:  result.Features,
+			CardScore: math.Floor((result.Eligibility*sc*10)*1000) / 1000,
+		}
+
+		creditCardResults = append(creditCardResults, creditCard)
+	}
+	return creditCardResults
+
 }
 
-func (userInfo *UserInfo) scoredCards() {
+//getScoredCards sends a post request to ScoredCard API endpoint and formats the response
+func (userInfo *UserInfo) getScoredCards() []CreditCard {
 	url := "https://m33dnjs979.execute-api.us-west-2.amazonaws.com/CS/v2/creditcards"
-	fmt.Println("URL:>", url)
 
 	var jsonStr = []byte(fmt.Sprintf(`{
 		"first-name": "%s",
@@ -117,8 +161,6 @@ func (userInfo *UserInfo) scoredCards() {
 		"employment-status": "%s",
 		"salary": %d
 	}`, userInfo.FirstName, userInfo.LastName, userInfo.DOB, userInfo.CreditScore, userInfo.EmpStatus, userInfo.Salary))
-	myString := string(jsonStr)
-	fmt.Printf("XXXXXXX: %v\n", myString)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))
 	req.Header.Set("Content-Type", "application/json")
 
@@ -129,8 +171,35 @@ func (userInfo *UserInfo) scoredCards() {
 	}
 	defer resp.Body.Close()
 
-	fmt.Println("response Status:", resp.Status)
-	fmt.Println("response Headers:", resp.Header)
 	body, _ := ioutil.ReadAll(resp.Body)
-	fmt.Println("response Body:", string(body))
+
+	var scoredCardResult []ScoredCardResponse
+
+	var creditCardResults []CreditCard
+
+	err = json.Unmarshal(body, &scoredCardResult)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var features []string
+	for _, result := range scoredCardResult {
+		sc := math.Pow(1/result.Apr, 2)
+		for _, attr := range result.Attributes {
+			features = append(features, attr)
+		}
+		for _, introOffer := range result.IntroOffers {
+			features = append(features, introOffer)
+		}
+
+		creditCard := CreditCard{
+			Provider:  "ScoredCards",
+			Name:      result.Card,
+			ApplyURL:  result.ApplyURL,
+			Apr:       result.Apr,
+			Features:  features,
+			CardScore: math.Floor((result.ApprovalRating*100*sc)*1000) / 1000,
+		}
+		creditCardResults = append(creditCardResults, creditCard)
+	}
+	return creditCardResults
 }
